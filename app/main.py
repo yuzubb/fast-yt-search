@@ -4,6 +4,7 @@ import re
 import time
 import base64
 from typing import Optional, Dict, Any, Tuple
+from urllib.parse import parse_qs, unquote
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
@@ -11,75 +12,30 @@ import httpx
 import uvicorn
 
 # ---------------------------------------------------------------------------
-# 設定
+# 設定（TVHTML5クライアント用に整合性を統一）
 # ---------------------------------------------------------------------------
 
+# TVクローン用のUser-Agent（InnerTubeのTVHTML5と一致させる）
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (SmartHUB; SMART-TV; U; Linux/SmartTV) AppleWebKit/537.42 (KHTML, like Gecko) Safari/537.42",
     "Accept-Language": "ja-JP,ja;q=0.9",
     "Accept-Encoding": "gzip, br, deflate",
 }
 
-# InnerTube API 設定
 INNERTUBE_URL = "https://www.youtubei.googleapis.com/youtubei/v1/player"
-INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"  # Web/Mobile公開クライアント用キー
+INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 
+# TVHTML5 クライアント（制限やPoToken要求を受けにくく直URLが取りやすい）
 INNERTUBE_CONTEXT = {
     "client": {
-        "clientName": "ANDROID",
-        "clientVersion": "19.09.37",
-        "androidSdkVersion": 30,
+        "clientName": "TVHTML5",
+        "clientVersion": "7.20260308.00.00",
         "hl": "ja",
         "gl": "JP",
     }
 }
 
-THUMB_CONCURRENCY = 8          # サムネイル同時ダウンロード数の上限
-CACHE_TTL_SEARCH = 60          # 検索結果キャッシュの有効秒数
-CACHE_TTL_STREAM = 120         # ストリーム情報キャッシュの有効秒数
-
-# 事前コンパイル正規表現（HTMLフォールバック用）
-RE_YT_INITIAL_DATA = re.compile(r"var ytInitialData = ({.*?});</script>")
-RE_PLAYER_PATTERNS = [
-    re.compile(r"ytInitialPlayerResponse\s*=\s*({.*?});(?:var|script)"),
-    re.compile(r"var\s+ytInitialPlayerResponse\s*=\s*({.*?});"),
-    re.compile(r'"playerResponse":\s*({.*?})\s*,\s*"responseContext"'),
-]
-
-# ---------------------------------------------------------------------------
-# 共有HTTPクライアント
-# ---------------------------------------------------------------------------
-
-client: Optional[httpx.AsyncClient] = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global client
-    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
-    client = httpx.AsyncClient(
-        headers=HEADERS,
-        follow_redirects=True,
-        limits=limits,
-        timeout=httpx.Timeout(10.0, connect=5.0),
-    )
-    try:
-        yield
-    finally:
-        if client:
-            await client.aclose()
-
-
-app = FastAPI(title="fast-yt-search", version="0.8.0", lifespan=lifespan)
-
-# ---------------------------------------------------------------------------
-# キャッシュ機能
-# ---------------------------------------------------------------------------
-
+CACHE_TTL_STREAM = 120
 _cache: Dict[str, Tuple[float, Any]] = {}
 
 
@@ -98,28 +54,33 @@ def cache_set(key: str, value: Any, ttl: float) -> None:
     _cache[key] = (time.monotonic() + ttl, value)
 
 
+client: Optional[httpx.AsyncClient] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global client
+    client = httpx.AsyncClient(
+        headers=HEADERS,
+        follow_redirects=True,
+        timeout=httpx.Timeout(10.0, connect=5.0),
+    )
+    try:
+        yield
+    finally:
+        if client:
+            await client.aclose()
+
+
+app = FastAPI(title="fast-yt-search", version="0.9.0", lifespan=lifespan)
+
+
 # ---------------------------------------------------------------------------
 # ヘルパー関数
 # ---------------------------------------------------------------------------
 
-async def get_base64_image(url: str, sem: asyncio.Semaphore) -> str:
-    """画像をダウンロードしてBase64形式に変換"""
-    if not url:
-        return ""
-    async with sem:
-        try:
-            res = await client.get(url, timeout=5.0)
-            if res.status_code == 200:
-                encoded = base64.b64encode(res.content).decode("utf-8")
-                content_type = res.headers.get("content-type", "image/jpeg")
-                return f"data:{content_type};base64,{encoded}"
-        except Exception:
-            pass
-    return ""
-
-
 async def fetch_player_response(video_id: str) -> Dict[str, Any]:
-    """InnerTube APIを直接叩いてplayerResponseを取得（ANDROIDクライアント経由）"""
+    """TVHTML5コンテキストでInnerTube APIをコール"""
     payload = {
         "context": INNERTUBE_CONTEXT,
         "videoId": video_id,
@@ -138,21 +99,19 @@ async def fetch_player_response(video_id: str) -> Dict[str, Any]:
     return {}
 
 
-def extract_player_response(html: str) -> Dict[str, Any]:
-    """HTMLからフォールバックとして playerResponse の JSON を抽出"""
-    for pattern in RE_PLAYER_PATTERNS:
-        match = pattern.search(html)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except Exception:
-                continue
-    return {}
-
-
 def parse_stream_item(fmt: Dict[str, Any], is_adaptive: bool = False) -> Optional[Dict[str, Any]]:
-    """個々のストリームフォーマットを解析"""
+    """直URLおよび signatureCipher からのURL抽出処理"""
     url = fmt.get("url")
+
+    # urlがなく signatureCipher / cipher がある場合の緊急抽出
+    if not url:
+        cipher_str = fmt.get("signatureCipher") or fmt.get("cipher")
+        if cipher_str:
+            cipher_data = parse_qs(cipher_str)
+            raw_url = cipher_data.get("url", [None])[0]
+            if raw_url:
+                url = unquote(raw_url)
+
     if not url:
         return None
 
@@ -184,132 +143,22 @@ def parse_stream_item(fmt: Dict[str, Any], is_adaptive: bool = False) -> Optiona
 # エンドポイント
 # ---------------------------------------------------------------------------
 
-@app.get("/")
-def read_root():
-    return {
-        "status": "ok",
-        "message": "Fast-YT-Search API (InnerTube Powered) is running!",
-        "endpoints": {
-            "search": "/api/search?q=キーワード",
-            "stream": "/api/stream/{video_id}",
-        },
-    }
-
-
-@app.get("/api/search")
-async def search(
-    q: str = Query(..., description="検索キーワード"),
-    p: int = Query(1, ge=1, description="ページ番号"),
-    n: int = Query(10, ge=1, le=50, description="取得件数"),
-    sort: Optional[str] = Query("relevance", description="並び替え"),
-    thumbnails: bool = Query(False, description="サムネイルをBase64化するか"),
-):
-    """YouTube検索エンドポイント"""
-    cache_key = f"search:{q}:{p}:{n}:{sort}:{thumbnails}"
-    cached = cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    sp_param = ""
-    if sort == "date":
-        sp_param = "&sp=CAI%253D"
-    elif sort == "views":
-        sp_param = "&sp=CAMSAhAB"
-    elif sort == "rating":
-        sp_param = "&sp=CAESAhAB"
-
-    url = f"https://www.youtube.com/results?search_query={q}{sp_param}"
-
-    response = await client.get(url)
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="YouTubeからの取得に失敗しました")
-
-    match = RE_YT_INITIAL_DATA.search(response.text)
-    if not match:
-        raise HTTPException(status_code=500, detail="データのパースに失敗しました")
-
-    data = json.loads(match.group(1))
-    raw_results = []
-
-    try:
-        sections = data["contents"]["twoColumnSearchResultsRenderer"]["primaryContents"][
-            "sectionListRenderer"
-        ]["contents"]
-        for section in sections:
-            contents = section.get("itemSectionRenderer", {}).get("contents", [])
-            for item in contents:
-                if "videoRenderer" in item:
-                    video = item["videoRenderer"]
-                    title_runs = video.get("title", {}).get("runs", [])
-                    title = title_runs[0].get("text") if title_runs else "タイトルなし"
-
-                    owner_runs = video.get("ownerText", {}).get("runs", [])
-                    channel = owner_runs[0].get("text") if owner_runs else "不明"
-
-                    thumb_url = video.get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url", "")
-
-                    raw_results.append({
-                        "type": "video",
-                        "id": video.get("videoId"),
-                        "url": f"https://www.youtube.com/watch?v={video.get('videoId')}",
-                        "title": title,
-                        "channel": channel,
-                        "views": video.get("viewCountText", {}).get("simpleText", "非表示"),
-                        "published": video.get("publishedTimeText", {}).get("simpleText", ""),
-                        "thumb_url": thumb_url,
-                    })
-    except KeyError:
-        pass
-
-    start_idx = (p - 1) * n
-    end_idx = start_idx + n
-    paginated_results = raw_results[start_idx:end_idx]
-
-    if thumbnails:
-        sem = asyncio.Semaphore(THUMB_CONCURRENCY)
-        thumb_urls = [item.get("thumb_url", "") for item in paginated_results]
-        encoded_list = await asyncio.gather(*(get_base64_image(u, sem) for u in thumb_urls))
-        for item, encoded in zip(paginated_results, encoded_list):
-            item.pop("thumb_url", None)
-            item["thumbnail_base64"] = encoded
-    else:
-        for item in paginated_results:
-            item["thumbnail_url"] = item.pop("thumb_url", "")
-
-    result = {
-        "query": q,
-        "page": p,
-        "limit": n,
-        "total_returned": len(paginated_results),
-        "results": paginated_results,
-    }
-    cache_set(cache_key, result, CACHE_TTL_SEARCH)
-    return result
-
-
 @app.get("/api/stream/{video_id}")
 async def get_stream(video_id: str):
-    """InnerTube API優先のストリーム解析エンドポイント"""
     cache_key = f"stream:{video_id}"
     cached = cache_get(cache_key)
     if cached is not None:
         return cached
 
-    # 1. InnerTube APIでプレイヤーレスポンスを取得
     player_data = await fetch_player_response(video_id)
 
-    # 2. 失敗時はHTMLスクレイピングへフォールバック
-    if not player_data or player_data.get("playabilityStatus", {}).get("status") != "OK":
-        html_res = await client.get(f"https://www.youtube.com/watch?v={video_id}")
-        if html_res.status_code == 200:
-            player_data = extract_player_response(html_res.text)
-
     if not player_data:
-        raise HTTPException(status_code=404, detail="プレイヤーデータが見つかりませんでした")
+        raise HTTPException(status_code=404, detail="プレイヤーデータが取得できませんでした")
 
-    # 3. 再生可否のチェック (ERROR, LOGIN_REQUIRED, UNPLAYABLE等)
     playability = player_data.get("playabilityStatus", {})
     status = playability.get("status")
+    
+    # OK以外（LOGIN_REQUIRED, UNPLAYABLE等）の場合はエラー内容を返却
     if status and status != "OK":
         reason = playability.get("reason") or status
         raise HTTPException(status_code=422, detail=f"再生不可 ({status}): {reason}")
@@ -321,13 +170,11 @@ async def get_stream(video_id: str):
     video_only_streams = []
     audio_only_streams = []
 
-    # 統合ストリーム (音声+映像)
     for fmt in streaming_data.get("formats", []):
         parsed = parse_stream_item(fmt, is_adaptive=False)
         if parsed:
             combined_streams.append(parsed)
 
-    # アダプティブストリーム (音声のみ / 映像のみ)
     for fmt in streaming_data.get("adaptiveFormats", []):
         parsed = parse_stream_item(fmt, is_adaptive=True)
         if parsed:
