@@ -9,10 +9,11 @@ import httpx
 import yt_dlp
 import uvicorn
 
-PROXY_URL = "http://qqpxdifi:zg5pybk83dzp@142.111.67.146:5611"
+PROXY_URL = os.getenv("PROXY_URL", "")
+COOKIES_FILE = os.getenv("YT_COOKIES_FILE", "")
 
 # --- innertube (YouTube内部API) 用の定数 ---
-INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"  # WEBクライアント用の公開キー
+INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 INNERTUBE_URL = f"https://www.youtube.com/youtubei/v1/search?key={INNERTUBE_API_KEY}"
 INNERTUBE_CONTEXT = {
     "client": {
@@ -38,22 +39,25 @@ HEADERS = {
 client: Optional[httpx.AsyncClient] = None
 
 # --- 簡易TTLキャッシュ ---
-CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", "300"))
+CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", "300"))  # 検索結果キャッシュ(秒)
+STREAM_CACHE_TTL = int(os.getenv("STREAM_CACHE_TTL", "1800"))  # ストリームURLキャッシュ(秒)
+
 _search_cache: Dict[str, Dict[str, Any]] = {}
+_stream_cache: Dict[str, Dict[str, Any]] = {}
 
 
-def cache_get(key: str):
-    entry = _search_cache.get(key)
+def _cache_get(store: Dict[str, Dict[str, Any]], key: str, ttl: int):
+    entry = store.get(key)
     if not entry:
         return None
-    if time.time() - entry["ts"] > CACHE_TTL:
-        _search_cache.pop(key, None)
+    if time.time() - entry["ts"] > ttl:
+        store.pop(key, None)
         return None
     return entry["data"]
 
 
-def cache_set(key: str, data: Any):
-    _search_cache[key] = {"data": data, "ts": time.time()}
+def _cache_set(store: Dict[str, Dict[str, Any]], key: str, data: Any):
+    store[key] = {"data": data, "ts": time.time()}
 
 
 @asynccontextmanager
@@ -77,8 +81,10 @@ async def lifespan(app: FastAPI):
             await client.aclose()
 
 
-app = FastAPI(title="fast-yt-search", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="fast-yt-search", version="1.1.0", lifespan=lifespan)
 
+
+# ================= 検索 (innertube API + キャッシュ) =================
 
 async def fetch_search_json(query: str) -> Dict[str, Any]:
     payload = {
@@ -91,9 +97,7 @@ async def fetch_search_json(query: str) -> Dict[str, Any]:
 
 
 def parse_search_entries(data: Dict[str, Any]) -> list:
-    """innertube検索レスポンスからvideoRendererだけを抽出する"""
     results = []
-
     try:
         contents = (
             data["contents"]["twoColumnSearchResultsRenderer"]
@@ -107,7 +111,7 @@ def parse_search_entries(data: Dict[str, Any]) -> list:
         for item in items:
             video = item.get("videoRenderer")
             if not video:
-                continue  # 広告・チャンネル・ミックス等はスキップ
+                continue
 
             video_id = video.get("videoId")
             title = "".join(
@@ -140,7 +144,7 @@ def parse_search_entries(data: Dict[str, Any]) -> list:
 def read_root():
     return {
         "status": "ok",
-        "message": "Fast-YT-Search API (Innertube + Cache) is running!",
+        "message": "Fast-YT-Search API (Innertube + po_token + Cache) is running!",
         "endpoints": {
             "search": "/api/search?q=キーワード",
             "stream": "/api/stream/{video_id}",
@@ -156,14 +160,14 @@ async def search(
 ):
     cache_key = f"{q}::all"
 
-    entries = cache_get(cache_key)
+    entries = _cache_get(_search_cache, cache_key, CACHE_TTL)
     if entries is None:
         try:
             data = await fetch_search_json(q)
             entries = parse_search_entries(data)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"検索エラー: {str(e)}")
-        cache_set(cache_key, entries)
+        _cache_set(_search_cache, cache_key, entries)
 
     start_idx = (p - 1) * n
     end_idx = start_idx + n
@@ -178,16 +182,25 @@ async def search(
     }
 
 
-# --- ストリーム取得は従来通りyt-dlp ---
+# ================= ストリーム取得 (yt-dlp + po_token + キャッシュ) =================
+
 def extract_with_ytdlp(url: str) -> Dict[str, Any]:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "extract_flat": False,
+        "extractor_args": {
+            "youtube": {
+                # po_token provider (bgutil) を使う想定のクライアント構成
+                "player_client": ["web", "android"],
+            }
+        },
     }
     if PROXY_URL:
         ydl_opts["proxy"] = PROXY_URL
+    if COOKIES_FILE:
+        ydl_opts["cookiefile"] = COOKIES_FILE
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
@@ -195,7 +208,12 @@ def extract_with_ytdlp(url: str) -> Dict[str, Any]:
 
 @app.get("/api/stream/{video_id}")
 async def get_stream(video_id: str):
+    cached = _cache_get(_stream_cache, video_id, STREAM_CACHE_TTL)
+    if cached is not None:
+        return cached
+
     target_url = f"https://www.youtube.com/watch?v={video_id}"
+
     try:
         info = await asyncio.to_thread(extract_with_ytdlp, target_url)
 
@@ -233,7 +251,7 @@ async def get_stream(video_id: str):
             elif has_audio and not has_video:
                 audio_only_streams.append(stream_info)
 
-        return {
+        result = {
             "video_id": video_id,
             "title": info.get("title"),
             "channel": info.get("uploader"),
@@ -245,6 +263,11 @@ async def get_stream(video_id: str):
                 "audio_only": audio_only_streams,
             },
         }
+
+        # ストリームURLには有効期限があるため、TTLは短めに設定すること
+        _cache_set(_stream_cache, video_id, result)
+        return result
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"yt-dlp解析エラー: {str(e)}")
 
