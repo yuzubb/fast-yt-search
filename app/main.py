@@ -1,6 +1,7 @@
 import os
 import time
 import asyncio
+from pathlib import Path
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -89,7 +90,12 @@ app = FastAPI(title="fast-yt-search", version="1.2.0", lifespan=lifespan, docs_u
 
 # Swagger UIのJS/CSSを外部CDNではなく自前で配信する
 # (Android化タブレット等、外部CDNに届かない/古いWebViewでも/docsが真っ白にならないようにするため)
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
+# このファイル(main.py)からの相対位置で static ディレクトリを解決する。
+# pipインストール後、Termux等の任意のカレントディレクトリから実行されても
+# 正しく見つかるようにするため、"app/static" のような相対パスは使わない。
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/docs", include_in_schema=False)
