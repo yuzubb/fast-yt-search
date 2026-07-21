@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Query
 import httpx
 import uvicorn
 
-PROXY_URL = os.getenv("PROXY_URL", "")
+PROXY_URL = os.getenv("PROXY_URL", "http://qqpxdifi:zg5pybk83dzp@142.111.67.146:5611")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (SmartHUB; SMART-TV; U; Linux/SmartTV) AppleWebKit/537.42 (KHTML, like Gecko) Safari/537.42",
