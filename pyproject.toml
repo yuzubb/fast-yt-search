@@ -4,27 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fast-yt-search"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python (FastAPI) で動作する高速・軽量な非公式YouTube検索API"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
   { name = "yuzubb", email = "yuzubb@users.noreply.github.com" }
 ]
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
-]
 
-# pip install 時に自動でインストールされる依存ライブラリ
 dependencies = [
-    "fastapi>=0.100.0",
-    "uvicorn[standard]>=0.20.0",
-    "httpx>=0.24.0",
+    "fastapi>=0.68.0,<0.100.0",
+    "uvicorn>=0.15.0",
+    "httpx>=0.23.0",
     "dict2xml>=1.7.0",
 ]
 
+[project.scripts]
+fast-yt-search = "app.main:cli"
+
 [project.urls]
-"Homepage" = "https://github.com/yuzubb/youtube-search-api"
-"Bug Tracker" = "https://github.com/yuzubb/youtube-search-api/issues"
+"Homepage" = "https://github.com/yuzubb/fast-yt-search"
+"Bug Tracker" = "https://github.com/yuzubb/fast-yt-search/issues"
