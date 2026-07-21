@@ -1,15 +1,27 @@
 import os
+import time
 import asyncio
-import base64
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 import httpx
-import uvicorn
 import yt_dlp
+import uvicorn
 
-PROXY_URL = os.getenv("PROXY_URL", "")
+PROXY_URL = "http://qqpxdifi:zg5pybk83dzp@142.111.67.146:5611"
+
+# --- innertube (YouTube内部API) 用の定数 ---
+INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"  # WEBクライアント用の公開キー
+INNERTUBE_URL = f"https://www.youtube.com/youtubei/v1/search?key={INNERTUBE_API_KEY}"
+INNERTUBE_CONTEXT = {
+    "client": {
+        "clientName": "WEB",
+        "clientVersion": "2.20260715.00.00",
+        "hl": "ja",
+        "gl": "JP",
+    }
+}
 
 HEADERS = {
     "User-Agent": (
@@ -18,9 +30,30 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ja-JP,ja;q=0.9",
+    "Content-Type": "application/json",
+    "X-YouTube-Client-Name": "1",
+    "X-YouTube-Client-Version": "2.20260715.00.00",
 }
 
 client: Optional[httpx.AsyncClient] = None
+
+# --- 簡易TTLキャッシュ ---
+CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", "300"))
+_search_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def cache_get(key: str):
+    entry = _search_cache.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["ts"] > CACHE_TTL:
+        _search_cache.pop(key, None)
+        return None
+    return entry["data"]
+
+
+def cache_set(key: str, data: Any):
+    _search_cache[key] = {"data": data, "ts": time.time()}
 
 
 @asynccontextmanager
@@ -47,6 +80,105 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="fast-yt-search", version="1.0.0", lifespan=lifespan)
 
 
+async def fetch_search_json(query: str) -> Dict[str, Any]:
+    payload = {
+        "context": INNERTUBE_CONTEXT,
+        "query": query,
+    }
+    resp = await client.post(INNERTUBE_URL, json=payload)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def parse_search_entries(data: Dict[str, Any]) -> list:
+    """innertube検索レスポンスからvideoRendererだけを抽出する"""
+    results = []
+
+    try:
+        contents = (
+            data["contents"]["twoColumnSearchResultsRenderer"]
+            ["primaryContents"]["sectionListRenderer"]["contents"]
+        )
+    except (KeyError, TypeError):
+        return results
+
+    for section in contents:
+        items = section.get("itemSectionRenderer", {}).get("contents", [])
+        for item in items:
+            video = item.get("videoRenderer")
+            if not video:
+                continue  # 広告・チャンネル・ミックス等はスキップ
+
+            video_id = video.get("videoId")
+            title = "".join(
+                run.get("text", "")
+                for run in video.get("title", {}).get("runs", [])
+            )
+            channel = None
+            owner_runs = video.get("ownerText", {}).get("runs", [])
+            if owner_runs:
+                channel = owner_runs[0].get("text")
+
+            view_count_text = video.get("viewCountText", {}).get("simpleText", "")
+            thumbnails = video.get("thumbnail", {}).get("thumbnails", [])
+            thumbnail_url = thumbnails[-1]["url"] if thumbnails else None
+
+            results.append({
+                "type": "video",
+                "id": video_id,
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "title": title,
+                "channel": channel,
+                "views": view_count_text,
+                "thumbnail_url": thumbnail_url,
+            })
+
+    return results
+
+
+@app.get("/")
+def read_root():
+    return {
+        "status": "ok",
+        "message": "Fast-YT-Search API (Innertube + Cache) is running!",
+        "endpoints": {
+            "search": "/api/search?q=キーワード",
+            "stream": "/api/stream/{video_id}",
+        },
+    }
+
+
+@app.get("/api/search")
+async def search(
+    q: str = Query(..., description="検索キーワード"),
+    p: int = Query(1, ge=1, description="ページ番号"),
+    n: int = Query(10, ge=1, le=50, description="取得件数"),
+):
+    cache_key = f"{q}::all"
+
+    entries = cache_get(cache_key)
+    if entries is None:
+        try:
+            data = await fetch_search_json(q)
+            entries = parse_search_entries(data)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"検索エラー: {str(e)}")
+        cache_set(cache_key, entries)
+
+    start_idx = (p - 1) * n
+    end_idx = start_idx + n
+    paginated = entries[start_idx:end_idx]
+
+    return {
+        "query": q,
+        "page": p,
+        "limit": n,
+        "total_returned": len(paginated),
+        "results": paginated,
+    }
+
+
+# --- ストリーム取得は従来通りyt-dlp ---
 def extract_with_ytdlp(url: str) -> Dict[str, Any]:
     ydl_opts = {
         "quiet": True,
@@ -61,61 +193,9 @@ def extract_with_ytdlp(url: str) -> Dict[str, Any]:
         return ydl.extract_info(url, download=False)
 
 
-@app.get("/")
-def read_root():
-    return {
-        "status": "ok",
-        "message": "Fast-YT-Search API (yt-dlp + Proxy) is running!",
-        "endpoints": {
-            "search": "/api/search?q=キーワード",
-            "stream": "/api/stream/{video_id}",
-        },
-    }
-
-
-@app.get("/api/search")
-async def search(
-    q: str = Query(..., description="検索キーワード"),
-    p: int = Query(1, ge=1, description="ページ番号"),
-    n: int = Query(10, ge=1, le=50, description="取得件数"),
-):
-    target_url = f"ytsearch{n * p}:{q}"
-
-    try:
-        info = await asyncio.to_thread(extract_with_ytdlp, target_url)
-        entries = info.get("entries", [])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"検索エラー: {str(e)}")
-
-    start_idx = (p - 1) * n
-    end_idx = start_idx + n
-    paginated = entries[start_idx:end_idx]
-
-    results = []
-    for entry in paginated:
-        results.append({
-            "type": "video",
-            "id": entry.get("id"),
-            "url": entry.get("webpage_url") or f"https://www.youtube.com/watch?v={entry.get('id')}",
-            "title": entry.get("title"),
-            "channel": entry.get("uploader") or entry.get("channel"),
-            "views": entry.get("view_count"),
-            "thumbnail_url": entry.get("thumbnail"),
-        })
-
-    return {
-        "query": q,
-        "page": p,
-        "limit": n,
-        "total_returned": len(results),
-        "results": results,
-    }
-
-
 @app.get("/api/stream/{video_id}")
 async def get_stream(video_id: str):
     target_url = f"https://www.youtube.com/watch?v={video_id}"
-
     try:
         info = await asyncio.to_thread(extract_with_ytdlp, target_url)
 
@@ -165,7 +245,6 @@ async def get_stream(video_id: str):
                 "audio_only": audio_only_streams,
             },
         }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"yt-dlp解析エラー: {str(e)}")
 
