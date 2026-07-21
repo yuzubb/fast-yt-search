@@ -9,7 +9,7 @@ description = "Python (FastAPI) で動作する高速・軽量な非公式YouTub
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
-  { name = "あなたの名前", email = "your.email@example.com" }
+  { name = "yuzubb", email = "yuzubb@users.noreply.github.com" }
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
