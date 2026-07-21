@@ -1,0 +1,30 @@
+services:
+  # po_token (Proof of Origin Token) を生成する常駐サーバー
+  # 公式イメージ: https://github.com/Brainicism/bgutil-ytdlp-pot-provider
+  pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-pot-provider
+    restart: unless-stopped
+    ports:
+      - "4416:4416"
+
+  # 検索・ストリーム取得API本体
+  api:
+    build: .
+    container_name: fast-yt-search
+    restart: unless-stopped
+    depends_on:
+      - pot-provider
+    ports:
+      - "8000:8000"
+    environment:
+      # pot-providerサービスをコンテナ名で名前解決してアクセス
+      - BGUTIL_POT_PROVIDER_URL=http://pot-provider:4416
+      # 必要ならプロキシやcookieファイルもここで指定
+      - PROXY_URL=${PROXY_URL:-}
+      - YT_COOKIES_FILE=${YT_COOKIES_FILE:-}
+      - SEARCH_CACHE_TTL=${SEARCH_CACHE_TTL:-300}
+      - STREAM_CACHE_TTL=${STREAM_CACHE_TTL:-1800}
+    volumes:
+      # cookies.txtを使う場合はここに配置してYT_COOKIES_FILEで指すパスと合わせる
+      - ./cookies:/srv/cookies:ro
