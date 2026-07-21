@@ -5,6 +5,8 @@ from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.openapi.docs import get_swagger_ui_html
 import httpx
 import yt_dlp
 import uvicorn
@@ -35,6 +37,8 @@ HEADERS = {
     "X-YouTube-Client-Name": "1",
     "X-YouTube-Client-Version": "2.20260715.00.00",
 }
+
+POT_PROVIDER_URL = os.getenv("BGUTIL_POT_PROVIDER_URL", "http://127.0.0.1:4416")
 
 client: Optional[httpx.AsyncClient] = None
 
@@ -81,7 +85,22 @@ async def lifespan(app: FastAPI):
             await client.aclose()
 
 
-app = FastAPI(title="fast-yt-search", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="fast-yt-search", version="1.2.0", lifespan=lifespan, docs_url=None)
+
+# Swagger UIのJS/CSSを外部CDNではなく自前で配信する
+# (Android化タブレット等、外部CDNに届かない/古いWebViewでも/docsが真っ白にならないようにするため)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - Swagger UI",
+        swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
+        swagger_css_url="/static/swagger-ui/swagger-ui.css",
+        swagger_favicon_url="/static/swagger-ui/favicon-32x32.png",
+    )
 
 
 # ================= 検索 (innertube API + キャッシュ) =================
@@ -150,6 +169,46 @@ def read_root():
             "stream": "/api/stream/{video_id}",
         },
     }
+
+
+@app.get("/api/pot-status")
+async def pot_status():
+    """po_token生成プロバイダー(bgutil)が生きているか確認するエンドポイント"""
+    ping_url = f"{POT_PROVIDER_URL}/ping"
+    try:
+        resp = await client.get(ping_url, timeout=5.0)
+        resp.raise_for_status()
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text
+        return {
+            "provider_url": POT_PROVIDER_URL,
+            "reachable": True,
+            "status_code": resp.status_code,
+            "response": body,
+        }
+    except Exception as e:
+        return {
+            "provider_url": POT_PROVIDER_URL,
+            "reachable": False,
+            "error": str(e),
+        }
+
+
+@app.get("/api/pot-token")
+async def get_pot_token(video_id: str = Query(..., description="紐付けるYouTube動画ID(content binding)")):
+    """bgutilプロバイダーから実際のpo_token値を取得するエンドポイント"""
+    get_pot_url = f"{POT_PROVIDER_URL}/get_pot"
+    payload = {
+        "content_binding": video_id,
+    }
+    try:
+        resp = await client.post(get_pot_url, json=payload, timeout=15.0)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"po_token取得エラー: {str(e)}")
 
 
 @app.get("/api/search")
@@ -251,12 +310,35 @@ async def get_stream(video_id: str):
             elif has_audio and not has_video:
                 audio_only_streams.append(stream_info)
 
+        # combined(音声+映像が1本になったファイル)はYouTube側の仕様で
+        # 360p(itag 18)程度までしか提供されない。720p以上が欲しい場合は
+        # video_only + audio_only を別々にダウンロードしてffmpeg等で結合する必要がある。
+        best_video_only = sorted(
+            [f for f in video_only_streams if f.get("resolution")],
+            key=lambda f: int(f["resolution"].split("x")[-1]) if "x" in (f.get("resolution") or "") else 0,
+            reverse=True,
+        )
+        best_audio_only = sorted(
+            audio_only_streams,
+            key=lambda f: f.get("filesize") or 0,
+            reverse=True,
+        )
+
         result = {
             "video_id": video_id,
             "title": info.get("title"),
             "channel": info.get("uploader"),
             "duration": info.get("duration"),
             "total_streams_found": len(combined_streams) + len(video_only_streams) + len(audio_only_streams),
+            "note": (
+                "combinedは音声+映像が1本のファイルで、YouTube仕様上360p程度が上限です。"
+                "720p以上が必要な場合は video_only と audio_only を別々に取得し、"
+                "ffmpeg等でマージしてください(recommended_high_quality を参照)。"
+            ),
+            "recommended_high_quality": {
+                "video_only": best_video_only[0] if best_video_only else None,
+                "audio_only": best_audio_only[0] if best_audio_only else None,
+            },
             "streams": {
                 "combined": combined_streams,
                 "video_only": video_only_streams,
