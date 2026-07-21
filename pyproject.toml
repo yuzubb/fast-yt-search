@@ -26,5 +26,5 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/あなたのGitHubユーザー名/youtube-search-api"
-"Bug Tracker" = "https://github.com/あなたのGitHubユーザー名/youtube-search-api/issues"
+"Homepage" = "https://github.com/yuzubb/youtube-search-api"
+"Bug Tracker" = "https://github.com/yuzubb/youtube-search-api/issues"
