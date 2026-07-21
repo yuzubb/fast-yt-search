@@ -3,4 +3,4 @@ uvicorn[standard]>=0.20.0
 httpx>=0.24.0
 dict2xml>=1.7.0
 h2
-yt-dlp
+yt_dlp
