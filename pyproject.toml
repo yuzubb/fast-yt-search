@@ -9,7 +9,7 @@ description = "Fast and lightweight unofficial YouTube search API"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
-  { name = "Yuzubbゆず", email = "Yuzubbゆず@users.noreply.github.com" }
+  { name = "yuzubb", email = "yuzubb@users.noreply.github.com" }
 ]
 
 dependencies = [
